@@ -2,7 +2,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { EvaluatedStack } from '@aws-cdk/toolkit-lib';
 import * as fs from 'fs-extra';
-import { formatResourceCheckSummary, runResourceChecks } from '../../lib/runner/resource-checks';
+import { formatResourceCheckSummary, normalizeResourceCheckReport, runResourceChecks } from '../../lib/runner/resource-checks';
 
 const stack = (stackName: string): EvaluatedStack => ({
   stackName,
@@ -71,4 +71,24 @@ describe('runResourceChecks', () => {
 test('formatResourceCheckSummary', () => {
   expect(formatResourceCheckSummary({ stackName: 'a', summary: { pass: 24, missing: 3 }, results: [] })).toEqual('a: 24 pass, 3 missing');
   expect(formatResourceCheckSummary({ stackName: 'a', summary: {}, results: [] })).toEqual('a: no resources checked');
+});
+
+test('normalizeResourceCheckReport replaces the deployment\'s values in expected and actual values and details', () => {
+  const deployed: EvaluatedStack = {
+    ...stack('a'),
+    physicalResourceIds: { Queue: 'https://sqs.eu-west-1.amazonaws.com/123456789012/a-Queue-1A2B3C4D5E6F' },
+  };
+  const report = normalizeResourceCheckReport({
+    stackName: 'a',
+    summary: { pass: 1, missing: 1 },
+    results: [
+      { logicalId: 'Queue', property: 'RedrivePolicy', status: 'pass', expected: { deadLetterTargetArn: 'arn:aws:sqs:eu-west-1:123456789012:dlq' }, actual: 30 },
+      { logicalId: 'Queue', property: '(exists)', status: 'missing', detail: 'queue https://sqs.eu-west-1.amazonaws.com/123456789012/a-Queue-1A2B3C4D5E6F does not exist' },
+    ],
+  }, deployed);
+
+  expect(report.results).toEqual([
+    { logicalId: 'Queue', property: 'RedrivePolicy', status: 'pass', expected: { deadLetterTargetArn: 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:dlq' }, actual: 30 },
+    { logicalId: 'Queue', property: '(exists)', status: 'missing', detail: 'queue ${Queue} does not exist' },
+  ]);
 });

@@ -3,6 +3,7 @@ import * as path from 'path';
 import type { EvaluatedStack } from '@aws-cdk/toolkit-lib';
 import * as fs from 'fs-extra';
 import { exec } from '../utils';
+import { deploymentValueNormalizer } from './resolved-snapshot';
 
 /**
  * One stack's results from the resource checker
@@ -68,6 +69,28 @@ export function runResourceChecks(stacks: EvaluatedStack[], options: ResourceChe
   } finally {
     fs.removeSync(workDir);
   }
+}
+
+/**
+ * A report with the values that depend on the deployment (physical ids, account, region) in its results'
+ * expected and actual values and details replaced the way resolved snapshots replace them, so it is the same for every
+ * deployment and doesn't record the account
+ */
+export function normalizeResourceCheckReport(report: ResourceCheckReport, stack: EvaluatedStack): ResourceCheckReport {
+  const replace = deploymentValueNormalizer(stack);
+  const normalize = (value: any): any => {
+    if (typeof value === 'string') {
+      return replace(value);
+    }
+    if (Array.isArray(value)) {
+      return value.map(normalize);
+    }
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, normalize(v)]));
+    }
+    return value;
+  };
+  return { ...report, results: report.results.map(normalize) };
 }
 
 /**

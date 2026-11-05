@@ -37,20 +37,14 @@ export interface ResolvedSnapshot {
 }
 
 /**
- * Make a stack's evaluated template independent of the deployment it was evaluated against.
- *
- * A value whose provenance the evaluation recorded is written as its provenance: an `Fn::Sub` template with
- * `${LogicalId}`, `${LogicalId.Attribute}`, `${AWS::Region}`, `${ImportValue:Name}` and so on in place of the values
- * that depend on the deployment. The other strings (and the literal text in provenance) are deployment-independent
- * unless a function computed them from a deployment-dependent value (e.g. `Fn::Select` of an attribute); in those,
- * this replaces:
+ * A function that replaces the values that depend on the deployment in a string, by matching the deployment's values:
  * - each generated physical id (one that doesn't appear in the resource's own properties) with `${LogicalId}`;
  *   the name at the end of a URL or ARN physical id with
  *   `${LogicalId.Name}`, and each part of a `|`-separated physical id with `${LogicalId[n]}`
  * - the stack id, account, region and partition with `${AWS::StackId}`, `${AWS::AccountId}`, `${AWS::Region}`
  *   and `${AWS::Partition}` (taken from the stack id)
  */
-export function resolvedSnapshot(stack: EvaluatedStack): ResolvedSnapshot {
+export function deploymentValueNormalizer(stack: EvaluatedStack): (value: string) => string {
   const replacements = new Map<string, string>();
   const add = (value: string | undefined, placeholder: string) => {
     if (value && !replacements.has(value)) {
@@ -82,7 +76,7 @@ export function resolvedSnapshot(stack: EvaluatedStack): ResolvedSnapshot {
 
   const embedded = [...replacements.keys()].filter((v) => v.length >= MIN_EMBEDDED_LENGTH).sort((a, b) => b.length - a.length);
   const embeddedPattern = embedded.length > 0 ? new RegExp(embedded.map(escapeRegExp).join('|'), 'g') : undefined;
-  const replace = (value: string) => {
+  return (value: string) => {
     const whole = replacements.get(value);
     if (whole !== undefined) {
       return whole;
@@ -90,7 +84,19 @@ export function resolvedSnapshot(stack: EvaluatedStack): ResolvedSnapshot {
     const replaced = embeddedPattern ? value.replace(embeddedPattern, (match) => replacements.get(match)!) : value;
     return partition ? replaced.split(`arn:${partition}:`).join('arn:${AWS::Partition}:') : replaced;
   };
+}
 
+/**
+ * Make a stack's evaluated template independent of the deployment it was evaluated against.
+ *
+ * A value whose provenance the evaluation recorded is written as its provenance: an `Fn::Sub` template with
+ * `${LogicalId}`, `${LogicalId.Attribute}`, `${AWS::Region}`, `${ImportValue:Name}` and so on in place of the values
+ * that depend on the deployment. The other strings (and the literal text in provenance) are deployment-independent
+ * unless a function computed them from a deployment-dependent value (e.g. `Fn::Select` of an attribute); those are
+ * normalized with `deploymentValueNormalizer`.
+ */
+export function resolvedSnapshot(stack: EvaluatedStack): ResolvedSnapshot {
+  const replace = deploymentValueNormalizer(stack);
   const sources = stack.provenance ?? {};
   // in provenance, only the literal text between placeholders can contain deployment values
   const replaceLiterals = (source: string) => source.split(/(\$\{[^}]*\})/).map((part, i) => (i % 2 === 1 ? part : replace(part))).join('');

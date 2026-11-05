@@ -14,7 +14,7 @@ import type { IntegTest } from './integration-tests';
 import type { ResolvedSnapshot } from './resolved-snapshot';
 import { resolvedSnapshot, writeResolvedSnapshots } from './resolved-snapshot';
 import type { ResourceCheckReport } from './resource-checks';
-import { formatResourceCheckSummary, runResourceChecks, writeResourceCheckReports } from './resource-checks';
+import { formatResourceCheckSummary, normalizeResourceCheckReport, runResourceChecks, writeResourceCheckReports } from './resource-checks';
 import type { DestructiveChange, AssertionResults, AssertionResult } from '../workers/common';
 import { DiagnosticReason, formatAssertionResults, formatError } from '../workers/common';
 
@@ -236,7 +236,8 @@ export class IntegTestRunner {
                 for (const error of errors) {
                   logger.warning(`${this.test.testName}/${testCaseName}: resource checks could not run for ${error}`);
                 }
-                resourceCheckReports.push(...reports);
+                resourceCheckReports.push(...reports.map((report) =>
+                  normalizeResourceCheckReport(report, evaluated.find((s) => s.stackName === report.stackName)!)));
               }
             }
           } finally {
