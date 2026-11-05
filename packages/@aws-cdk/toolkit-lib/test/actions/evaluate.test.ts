@@ -117,6 +117,14 @@ describe('evaluate', () => {
       BucketName742CD8B0: 'CFN-BucketName742CD8B0-abc',
     }));
 
+    // where the deployment-dependent values came from
+    expect(stack.provenance).toEqual(expect.objectContaining({
+      'Resources.BucketName742CD8B0.Properties.Value': '${MyBucketF68F3FF0}',
+      'Outputs.BucketArn.Value': '${MyBucketF68F3FF0.Arn}',
+      'Outputs.Name.Value': '${AWS::StackName}',
+      'Outputs.Joined.Value': '${MyBucketF68F3FF0}-${AWS::Region}',
+    }));
+
     // the attribute that needs a Cloud Control lookup is kept and reported
     expect(stack.template.Outputs.BucketDomain.Value).toEqual({ 'Fn::GetAtt': ['MyBucketF68F3FF0', 'RegionalDomainName'] });
     expect(stack.unresolved).toEqual([expect.objectContaining({

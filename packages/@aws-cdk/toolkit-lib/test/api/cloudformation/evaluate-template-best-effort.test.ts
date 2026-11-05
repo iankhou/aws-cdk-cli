@@ -431,3 +431,136 @@ describe('evaluateTemplateBestEffort', () => {
     });
   });
 });
+
+describe('provenance', () => {
+  /** Ref, Fn::GetAtt (as `LogicalId.Attribute`), Fn::ImportValue (as `import:Name`), Fn::Join, Fn::Sub, Fn::Select, Fn::Split */
+  function evaluator(values: { [name: string]: any }): EvaluateCloudFormationTemplate {
+    const lookup = (key: string) => {
+      if (!(key in values)) {
+        throw new CfnEvaluationException(`'${key}' could not be found for evaluation`);
+      }
+      return values[key];
+    };
+    async function evaluateCfnExpression(expr: any): Promise<any> {
+      if (Array.isArray(expr)) {
+        const out = [];
+        for (const x of expr) {
+          out.push(await evaluateCfnExpression(x));
+        }
+        return out;
+      }
+      if (expr === null || typeof expr !== 'object') {
+        return expr;
+      }
+      const [fn] = Object.keys(expr);
+      const args = expr[fn];
+      switch (fn) {
+        case 'Ref': return lookup(args);
+        case 'Fn::GetAtt': return lookup(Array.isArray(args) ? args.join('.') : args);
+        case 'Fn::ImportValue': return lookup(`import:${await evaluateCfnExpression(args)}`);
+        case 'Fn::Join': return (await evaluateCfnExpression(args[1])).join(args[0]);
+        case 'Fn::Split': return (await evaluateCfnExpression(args[1])).split(args[0]);
+        case 'Fn::Select': return (await evaluateCfnExpression(args[1]))[args[0]];
+        case 'Fn::Sub': {
+          const [text, vars] = Array.isArray(args) ? args : [args, {}];
+          const evaluatedVars: { [name: string]: any } = {};
+          for (const [name, v] of Object.entries(vars ?? {})) {
+            evaluatedVars[name] = await evaluateCfnExpression(v);
+          }
+          return text.replace(/\$\{([^}]*)\}/g, (_: string, name: string) =>
+            name.startsWith('!') ? `\${${name.slice(1)}}` : name in evaluatedVars ? evaluatedVars[name] : lookup(name));
+        }
+      }
+      throw new CfnUnsupportedFunctionException(fn);
+    }
+    return { evaluateCfnExpression } as unknown as EvaluateCloudFormationTemplate;
+  }
+
+  const values = {
+    'Bucket': 'my-stack-bucket-1a2b3c',
+    'Bucket.Arn': 'arn:aws:s3:::my-stack-bucket-1a2b3c',
+    'Api': 'l06ykg2',
+    'Api.RootResourceId': 'xyz789',
+    'Stage': 'prod',
+    'AWS::Region': 'eu-west-1',
+    'AWS::Partition': 'aws',
+    'AWS::AccountId': '123456789012',
+    'Env': 'test',
+    'import:shared-plan-id': 'up-abc123',
+  };
+
+  const resources = (properties: { [name: string]: any }) => ({
+    Parameters: { Env: { Type: 'String' } },
+    Resources: {
+      Bucket: { Type: 'AWS::S3::Bucket' },
+      Api: { Type: 'AWS::ApiGateway::RestApi' },
+      Stage: { Type: 'AWS::ApiGateway::Stage', Properties: { StageName: 'prod' } },
+      Thing: { Type: 'Some::Resource', Properties: properties },
+    },
+  });
+
+  test('writes deployment-dependent strings as Fn::Sub templates over the stack', async () => {
+    const result = await evaluateTemplateBestEffort(evaluator(values), resources({
+      Name: { Ref: 'Bucket' },
+      Root: { 'Fn::GetAtt': ['Api', 'RootResourceId'] },
+      Target: { 'Fn::Join': ['', ['integrations/', { Ref: 'Api' }]] },
+      Policy: { 'Fn::Sub': 'arn:${AWS::Partition}:s3:::${Bucket}/${Env}/*' },
+      Plan: { 'Fn::ImportValue': 'shared-plan-id' },
+      Stage: { Ref: 'Stage' },
+    }));
+
+    expect(result.template.Resources.Thing.Properties.Target).toEqual('integrations/l06ykg2');
+    expect(result.provenance).toEqual({
+      'Resources.Thing.Properties.Name': '${Bucket}',
+      'Resources.Thing.Properties.Root': '${Api.RootResourceId}',
+      'Resources.Thing.Properties.Target': 'integrations/${Api}',
+      'Resources.Thing.Properties.Policy': 'arn:${AWS::Partition}:s3:::${Bucket}/test/*',
+      'Resources.Thing.Properties.Plan': '${ImportValue:shared-plan-id}',
+      'Resources.Thing.Properties.Stage': '${Stage}',
+    });
+  });
+
+  test('does not list values that only depend on literals and parameters', async () => {
+    const result = await evaluateTemplateBestEffort(evaluator(values), resources({
+      Literal: 'plain',
+      FromParameter: { Ref: 'Env' },
+      Joined: { 'Fn::Join': ['-', ['a', { Ref: 'Env' }]] },
+    }));
+
+    expect(result.provenance).toEqual({});
+  });
+
+  test('does not list values a function computes from a deployment-dependent value', async () => {
+    const result = await evaluateTemplateBestEffort(evaluator(values), resources({
+      Service: { 'Fn::Select': [2, { 'Fn::Split': [':', { 'Fn::GetAtt': ['Bucket', 'Arn'] }] }] },
+    }));
+
+    expect(result.template.Resources.Thing.Properties.Service).toEqual('s3');
+    expect(result.provenance).toEqual({});
+  });
+
+  test('uses the paths in the evaluated template, after Fn::If and AWS::NoValue', async () => {
+    const result = await evaluateTemplateBestEffort(evaluator(values), {
+      ...resources({
+        List: [{ Ref: 'AWS::NoValue' }, 'literal', { 'Fn::If': ['Yes', { Ref: 'Bucket' }, 'no'] }],
+      }),
+      Conditions: { Yes: { 'Fn::Equals': [{ Ref: 'Env' }, 'test'] } },
+    });
+
+    expect(result.template.Resources.Thing.Properties.List).toEqual(['literal', 'my-stack-bucket-1a2b3c']);
+    expect(result.provenance).toEqual({ 'Resources.Thing.Properties.List.1': '${Bucket}' });
+  });
+
+  test('writes literal ${ the way Fn::Sub escapes it', async () => {
+    const result = await evaluateTemplateBestEffort(evaluator(values), resources({
+      Text: { 'Fn::Sub': '${!Literal} in ${Bucket}' },
+      Joined: { 'Fn::Join': ['', ['${x}', { Ref: 'Bucket' }]] },
+    }));
+
+    expect(result.template.Resources.Thing.Properties.Text).toEqual('${Literal} in my-stack-bucket-1a2b3c');
+    expect(result.provenance).toEqual({
+      'Resources.Thing.Properties.Text': '${!Literal} in ${Bucket}',
+      'Resources.Thing.Properties.Joined': '${!x}${Bucket}',
+    });
+  });
+});

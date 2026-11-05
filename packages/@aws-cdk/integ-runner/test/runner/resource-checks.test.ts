@@ -11,6 +11,7 @@ const stack = (stackName: string): EvaluatedStack => ({
   physicalResourceIds: { Queue: `${stackName}-Queue` },
   template: { Resources: { Queue: { Type: 'AWS::SQS::Queue', Properties: { VisibilityTimeout: 30 } } } },
   unresolved: [],
+  provenance: {},
 });
 
 /**

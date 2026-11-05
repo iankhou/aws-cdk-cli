@@ -39,7 +39,11 @@ export interface ResolvedSnapshot {
 /**
  * Make a stack's evaluated template independent of the deployment it was evaluated against.
  *
- * Replaces, in every string value:
+ * A value whose provenance the evaluation recorded is written as its provenance: an `Fn::Sub` template with
+ * `${LogicalId}`, `${LogicalId.Attribute}`, `${AWS::Region}`, `${ImportValue:Name}` and so on in place of the values
+ * that depend on the deployment. The other strings (and the literal text in provenance) are deployment-independent
+ * unless a function computed them from a deployment-dependent value (e.g. `Fn::Select` of an attribute); in those,
+ * this replaces:
  * - each generated physical id (one that doesn't appear in the resource's own properties) with `${LogicalId}`;
  *   the name at the end of a URL or ARN physical id with
  *   `${LogicalId.Name}`, and each part of a `|`-separated physical id with `${LogicalId[n]}`
@@ -87,7 +91,12 @@ export function resolvedSnapshot(stack: EvaluatedStack): ResolvedSnapshot {
     return partition ? replaced.split(`arn:${partition}:`).join('arn:${AWS::Partition}:') : replaced;
   };
 
-  const resources = mapStrings(stack.template.Resources ?? {}, replace);
+  const sources = stack.provenance ?? {};
+  // in provenance, only the literal text between placeholders can contain deployment values
+  const replaceLiterals = (source: string) => source.split(/(\$\{[^}]*\})/).map((part, i) => (i % 2 === 1 ? part : replace(part))).join('');
+  const normalize = (value: string, at: string) => (at in sources ? replaceLiterals(sources[at]) : replace(value));
+
+  const resources = mapStrings(stack.template.Resources ?? {}, normalize, 'Resources');
   const accountWide = Object.entries<any>(stack.template.Resources ?? {})
     .filter(([, r]) => ACCOUNT_WIDE_TYPES.has(r?.Type))
     .map(([logicalId]) => logicalId);
@@ -96,8 +105,9 @@ export function resolvedSnapshot(stack: EvaluatedStack): ResolvedSnapshot {
     version: '1',
     stackName: stack.stackName,
     resources,
-    ...(stack.template.Outputs ? { outputs: mapStrings(stack.template.Outputs, replace) } : {}),
-    unresolved: stack.unresolved,
+    ...(stack.template.Outputs ? { outputs: mapStrings(stack.template.Outputs, normalize, 'Outputs') } : {}),
+    // reasons can quote the deployment's values (e.g. the identifier of a resource that couldn't be read)
+    unresolved: stack.unresolved.map((u) => ({ ...u, reason: replace(u.reason) })),
     ...(accountWide.length > 0 ? { accountWide } : {}),
     ...(stack.nestedStacks ? {
       nestedStacks: Object.fromEntries(Object.entries(stack.nestedStacks).map(([id, nested]) => [id, resolvedSnapshot(nested)])),
@@ -114,15 +124,16 @@ export async function writeResolvedSnapshots(snapshotDirectory: string, snapshot
   }
 }
 
-function mapStrings(value: any, fn: (s: string) => string): any {
+/** Map every string in a value; `at` is the value's path, like the paths in `EvaluatedStack.provenance` */
+function mapStrings(value: any, fn: (s: string, at: string) => string, at: string): any {
   if (typeof value === 'string') {
-    return fn(value);
+    return fn(value, at);
   }
   if (Array.isArray(value)) {
-    return value.map((x) => mapStrings(x, fn));
+    return value.map((x, i) => mapStrings(x, fn, `${at}.${i}`));
   }
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([k, x]) => [k, mapStrings(x, fn)]));
+    return Object.fromEntries(Object.entries(value).map(([k, x]) => [k, mapStrings(x, fn, `${at}.${k}`)]));
   }
   return value;
 }

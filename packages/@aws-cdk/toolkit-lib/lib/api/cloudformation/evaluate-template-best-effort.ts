@@ -17,6 +17,13 @@ export interface BestEffortEvaluation {
    * The expressions that could not be evaluated
    */
   readonly unresolved: UnresolvedExpression[];
+
+  /**
+   * Where the evaluated strings that depend on the deployment came from, by their path in `template`
+   *
+   * See `EvaluatedStack.provenance`.
+   */
+  readonly provenance: { [path: string]: string };
 }
 
 export interface BestEffortOptions {
@@ -62,6 +69,7 @@ export async function evaluateTemplateBestEffort(
   options: BestEffortOptions = {},
 ): Promise<BestEffortEvaluation> {
   const unresolved: UnresolvedExpression[] = [];
+  const provenance: { [path: string]: string } = {};
   const conditions = new Map<string, Promise<Truth>>();
   const unavailable = options.unavailableParameters ?? {};
   const noEcho = new Set(Object.keys(unavailable));
@@ -131,11 +139,156 @@ export async function evaluateTemplateBestEffort(
     return node;
   }
 
-  async function evaluate(node: any, path: string): Promise<any> {
+  /**
+   * The value of an expression written as a `Fn::Sub` template, with every value that depends on the deployment written
+   * as a placeholder: `${LogicalId}` for a resource's `Ref`, `${LogicalId.Attribute}` for `Fn::GetAtt`,
+   * `${AWS::Region}` (and the other pseudo parameters), and `${ImportValue:ExportName}` for `Fn::ImportValue`.
+   * Parameters are written as their values.
+   *
+   * Undefined if the value can't be written this way, because a function computes it from a deployment-dependent
+   * value (for example `Fn::Select` of an attribute).
+   */
+  async function sourceOf(node: any): Promise<string | undefined> {
+    if (typeof node === 'string') {
+      return escapeSub(node);
+    }
+    if (typeof node === 'number' || typeof node === 'boolean') {
+      return String(node);
+    }
+    if (node === null || typeof node !== 'object' || Array.isArray(node)) {
+      return undefined;
+    }
+    const intrinsic = intrinsicName(node);
+    if (!intrinsic) {
+      return undefined;
+    }
+    const args = node[intrinsic];
+    switch (intrinsic) {
+      case 'Ref':
+        return typeof args === 'string' ? refSource(args) : undefined;
+      case 'Fn::GetAtt': {
+        const [logicalId, attribute] = typeof args === 'string' ? splitOnce(args, '.') : Array.isArray(args) ? args : [];
+        return typeof logicalId === 'string' && typeof attribute === 'string' ? `\${${logicalId}.${attribute}}` : undefined;
+      }
+      case 'Fn::Join': {
+        const [separator, list] = Array.isArray(args) ? args : [];
+        if (typeof separator !== 'string' || !Array.isArray(list)) {
+          return undefined;
+        }
+        const parts: string[] = [];
+        for (const x of list) {
+          if (x?.Ref === 'AWS::NoValue') {
+            continue;
+          }
+          const part = await sourceOf(x);
+          if (part === undefined) {
+            return undefined;
+          }
+          parts.push(part);
+        }
+        return parts.join(escapeSub(separator));
+      }
+      case 'Fn::Sub': {
+        const [text, vars] = Array.isArray(args) ? args : [args, {}];
+        if (typeof text !== 'string') {
+          return undefined;
+        }
+        let out = '';
+        let last = 0;
+        for (const m of text.matchAll(/\$\{([^}]*)\}/g)) {
+          out += text.slice(last, m.index);
+          last = m.index! + m[0].length;
+          const name = m[1];
+          if (name.startsWith('!')) {
+            out += m[0]; // literal text, already written the way Fn::Sub escapes it
+            continue;
+          }
+          const part = vars && name in vars ? await sourceOf(vars[name])
+            : name.includes('.') ? `\${${name}}`
+              : await refSource(name);
+          if (part === undefined) {
+            return undefined;
+          }
+          out += part;
+        }
+        return out + text.slice(last);
+      }
+      case 'Fn::ImportValue': {
+        const exportName = await sourceOf(args);
+        return exportName === undefined || exportName.includes('${') ? undefined : `\${ImportValue:${exportName}}`;
+      }
+      case 'Fn::If': {
+        const [conditionName, whenTrue, whenFalse] = args;
+        const truth = await condition(conditionName);
+        return truth === undefined ? undefined : sourceOf(truth ? whenTrue : whenFalse);
+      }
+      default: {
+        if (dependsOnDeployment(node)) {
+          return undefined;
+        }
+        const value = await evaluateOnce(node);
+        return typeof value === 'string' ? escapeSub(value) : undefined;
+      }
+    }
+  }
+
+  async function refSource(name: string): Promise<string | undefined> {
+    if (name === 'AWS::NoValue') {
+      return undefined;
+    }
+    if (name.startsWith('AWS::') || template.Resources?.[name] !== undefined) {
+      return `\${${name}}`;
+    }
+    // a parameter: the value it was deployed with
+    const value = await evaluateOnce({ Ref: name });
+    return typeof value === 'string' ? escapeSub(value) : undefined;
+  }
+
+  /** Whether an expression's value can differ between deployments of the same template with the same parameters */
+  function dependsOnDeployment(node: any): boolean {
+    if (Array.isArray(node)) {
+      return node.some(dependsOnDeployment);
+    }
+    if (node === null || typeof node !== 'object') {
+      return false;
+    }
+    if (typeof node.Ref === 'string') {
+      return template.Parameters?.[node.Ref] === undefined;
+    }
+    if ('Fn::GetAtt' in node || 'Fn::ImportValue' in node || 'Fn::GetAZs' in node) {
+      return true;
+    }
+    if ('Fn::Sub' in node) {
+      const [text, vars] = Array.isArray(node['Fn::Sub']) ? node['Fn::Sub'] : [node['Fn::Sub'], {}];
+      const placeholders = [...String(text).matchAll(/\$\{([^}!][^}]*)\}/g)].map((m) => m[1]);
+      if (placeholders.some((name) => !(name in (vars ?? {})) && template.Parameters?.[name] === undefined)) {
+        return true;
+      }
+    }
+    return Object.values(node).some(dependsOnDeployment);
+  }
+
+  /** Remember where an evaluated string came from, if it depends on the deployment */
+  async function recordSource(node: any, value: any, outPath: string | undefined) {
+    if (outPath === undefined || typeof value !== 'string') {
+      return;
+    }
+    const source = await sourceOf(node);
+    if (source !== undefined && source !== escapeSub(value)) {
+      provenance[outPath] = source;
+    }
+  }
+
+  /**
+   * @param path - the expression's path in the template, for reporting
+   * @param outPath - the value's path in the evaluated template (differs from `path` after `Fn::If` and `AWS::NoValue`);
+   *   undefined for values that aren't part of it (conditions)
+   */
+  async function evaluate(node: any, path: string, outPath?: string): Promise<any> {
     if (Array.isArray(node)) {
       const out = [];
       for (const [i, x] of node.entries()) {
-        const value = await evaluate(x, `${path}.${i}`);
+        const value = await evaluate(x, `${path}.${i}`, outPath && `${outPath}.${out.length}`);
         if (value !== NO_VALUE) {
           out.push(value);
         }
@@ -152,7 +305,7 @@ export async function evaluateTemplateBestEffort(
     if (!intrinsic) {
       const out: { [key: string]: any } = {};
       for (const [key, value] of Object.entries(node)) {
-        const evaluated = await evaluate(value, `${path}.${key}`);
+        const evaluated = await evaluate(value, `${path}.${key}`, outPath && `${outPath}.${key}`);
         if (evaluated !== NO_VALUE) {
           out[key] = evaluated;
         }
@@ -170,20 +323,20 @@ export async function evaluateTemplateBestEffort(
         unresolved.push({ path, intrinsic, reason: `condition '${conditionName}' could not be evaluated` });
         return node;
       }
-      return evaluate(truth ? whenTrue : whenFalse, `${path}.Fn::If.${truth ? 1 : 2}`);
+      return evaluate(truth ? whenTrue : whenFalse, `${path}.Fn::If.${truth ? 1 : 2}`, outPath);
     }
 
     const masked = noEchoReferences(node, noEcho);
     if (masked.length > 0) {
       // Don't evaluate: the deployed value is masked, and the evaluator would fall back to the template default
       const before = unresolved.length;
-      const args = intrinsic === 'Ref' ? node.Ref : await evaluate(node[intrinsic], `${path}.${intrinsic}`);
+      const args = intrinsic === 'Ref' ? node.Ref : await evaluate(node[intrinsic], `${path}.${intrinsic}`, outPath && `${outPath}.${intrinsic}`);
       if (args === NO_VALUE) {
         return noValueArgument(node, intrinsic, path);
       }
       if (intrinsic !== 'Ref' && unresolved.length === before && noEchoReferences({ [intrinsic]: args }, noEcho).length === 0) {
         // the references were only in Fn::If branches that weren't taken
-        return evaluate({ [intrinsic]: args }, path);
+        return evaluate({ [intrinsic]: args }, path, outPath);
       }
       if (unresolved.length === before) {
         unresolved.push({ path, intrinsic, reason: masked.map((m) => `references parameter '${m}': ${unavailable[m]}`).join('; ') });
@@ -200,13 +353,14 @@ export async function evaluateTemplateBestEffort(
         unresolved.push({ path, intrinsic, reason: 'evaluates to a dynamic reference, which CloudFormation resolves at deployment' });
         return node;
       }
+      await recordSource(node, value, outPath);
       return value;
     } catch (e) {
       if (!isUnresolvable(e)) {
         throw e;
       }
       const before = unresolved.length;
-      const args = await evaluate(node[intrinsic], `${path}.${intrinsic}`);
+      const args = await evaluate(node[intrinsic], `${path}.${intrinsic}`, outPath && `${outPath}.${intrinsic}`);
       if (args === NO_VALUE) {
         return noValueArgument(node, intrinsic, path);
       }
@@ -214,7 +368,9 @@ export async function evaluateTemplateBestEffort(
       if (!unsupported && unresolved.length === before && !containsExpression(args)) {
         // The arguments contained expressions only this function evaluates (Fn::If, AWS::NoValue): retry with their values
         try {
-          return await evaluateOnce({ [intrinsic]: args });
+          const value = await evaluateOnce({ [intrinsic]: args });
+          await recordSource(node, value, outPath);
+          return value;
         } catch (retryError) {
           if (!isUnresolvable(retryError)) {
             throw retryError;
@@ -236,7 +392,7 @@ export async function evaluateTemplateBestEffort(
       if (typeof element?.Condition === 'string' && (await condition(element.Condition)) === false) {
         continue; // not created by CloudFormation
       }
-      out[logicalId] = await evaluate(element, `${name}.${logicalId}`);
+      out[logicalId] = await evaluate(element, `${name}.${logicalId}`, `${name}.${logicalId}`);
     }
     return out;
   }
@@ -301,7 +457,17 @@ export async function evaluateTemplateBestEffort(
       evaluated[section] = await evaluateSection(template[section], section);
     }
   }
-  return { template: evaluated, unresolved };
+  return { template: evaluated, unresolved, provenance };
+}
+
+/** Text as it is written in a `Fn::Sub` template: `${` is written `${!` */
+function escapeSub(text: string): string {
+  return text.replace(/\$\{/g, '${!');
+}
+
+function splitOnce(text: string, separator: string): [string, string] | [] {
+  const i = text.indexOf(separator);
+  return i < 0 ? [] : [text.slice(0, i), text.slice(i + separator.length)];
 }
 
 function intrinsicName(node: { [key: string]: any }): string | undefined {

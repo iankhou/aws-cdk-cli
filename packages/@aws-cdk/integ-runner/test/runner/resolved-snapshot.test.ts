@@ -57,6 +57,8 @@ function deployment(suffix: string, account: string, region: string): EvaluatedS
       },
     },
     unresolved: [],
+    // no provenance: these values are normalized by matching the deployment's values
+    provenance: {},
   };
 }
 
@@ -104,6 +106,66 @@ describe('resolvedSnapshot', () => {
     const snapshot = resolvedSnapshot(deployment('7l66agrnngob', '111111111111', 'us-east-1'));
 
     expect(snapshot.accountWide).toEqual(['ApiAccount']);
+  });
+
+  test('writes values with provenance as their provenance, including those matching values cannot normalize', () => {
+    const deploy = (suffix: string, rootResourceId: string, account: string, region: string): EvaluatedStack => ({
+      stackName: 'api-stack',
+      hierarchicalId: 'api-stack',
+      stackId: `arn:aws:cloudformation:${region}:${account}:stack/api-stack/${suffix}`,
+      physicalResourceIds: { Api: suffix.slice(0, 7), Integration: `${suffix.slice(0, 6)}x` },
+      template: {
+        Resources: {
+          Method: {
+            Type: 'AWS::ApiGateway::Method',
+            Properties: {
+              // a Fn::GetAtt that isn't any resource's physical id
+              ResourceId: rootResourceId,
+              // a short id inside a longer string
+              Target: `integrations/${suffix.slice(0, 6)}x`,
+              // from another stack
+              UsagePlanId: `up${suffix.slice(0, 4)}`,
+              // literal text around the placeholders is still normalized
+              Uri: `arn:aws:apigateway:${region}:lambda:path/functions/arn:aws:lambda:${region}:${account}:function:fn/invocations`,
+              HttpMethod: 'GET',
+            },
+          },
+        },
+      },
+      unresolved: [],
+      provenance: {
+        'Resources.Method.Properties.ResourceId': '${Api.RootResourceId}',
+        'Resources.Method.Properties.Target': 'integrations/${Integration}',
+        'Resources.Method.Properties.UsagePlanId': '${ImportValue:shared-usage-plan}',
+        'Resources.Method.Properties.Uri': `arn:\${AWS::Partition}:apigateway:\${AWS::Region}:lambda:path/functions/arn:aws:lambda:${region}:${account}:function:fn/invocations`,
+      },
+    });
+
+    const a = resolvedSnapshot(deploy('l06ykg2abc', 'xyz789', '111111111111', 'us-east-1'));
+    const b = resolvedSnapshot(deploy('0ho2hqadef', 'abc123', '222222222222', 'eu-west-2'));
+
+    expect(a).toEqual(b);
+    expect(a.resources.Method.Properties).toEqual({
+      ResourceId: '${Api.RootResourceId}',
+      Target: 'integrations/${Integration}',
+      UsagePlanId: '${ImportValue:shared-usage-plan}',
+      Uri: 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/functions/arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:fn/invocations',
+      HttpMethod: 'GET',
+    });
+  });
+
+  test('replaces the deployment\'s values in the reasons expressions are unresolved', () => {
+    const withReason = (suffix: string, account: string, region: string): EvaluatedStack => {
+      const d = deployment(suffix, account, region);
+      const queueUrl = d.physicalResourceIds.JobsQueue1A2B3C4D;
+      return { ...d, unresolved: [{ path: 'Resources.X.Properties.Y', intrinsic: 'Fn::GetAtt', reason: `resource with identifier '${queueUrl}' was not found` }] };
+    };
+
+    const a = resolvedSnapshot(withReason('7l66agrnngob', '111111111111', 'us-east-1'));
+    const b = resolvedSnapshot(withReason('xt2nevv23fvk', '222222222222', 'eu-west-2'));
+
+    expect(a.unresolved).toEqual(b.unresolved);
+    expect(a.unresolved[0].reason).toEqual("resource with identifier '${JobsQueue1A2B3C4D}' was not found");
   });
 
   test('keeps unresolved expressions, and includes nested stacks', () => {

@@ -90,6 +90,21 @@ export interface EvaluatedStack {
   readonly unresolved: UnresolvedExpression[];
 
   /**
+   * Where the evaluated strings that depend on the deployment came from, by their path in `template`
+   * (e.g. `Resources.Policy.Properties.PolicyDocument.Statement.0.Resource`)
+   *
+   * Each is the value written as a `Fn::Sub` template, with a placeholder for every value that can differ between
+   * deployments of the same template: `${LogicalId}` for a resource's `Ref`, `${LogicalId.Attribute}` for
+   * `Fn::GetAtt`, `${AWS::Region}` (and the other pseudo parameters), and `${ImportValue:ExportName}` for
+   * `Fn::ImportValue`. Parameters are written as their values, and literal `${` as `${!`.
+   * For example `arn:${AWS::Partition}:s3:::${Bucket}/*`, or `${RestApi.RootResourceId}`.
+   *
+   * Strings a function computes from a deployment-dependent value (for example `Fn::Select` of an attribute)
+   * are not listed.
+   */
+  readonly provenance: { [path: string]: string };
+
+  /**
    * The stack's deployed CDK-managed nested stacks, evaluated the same way, by logical id
    *
    * A nested stack gets the parameter values its parent passes, as evaluated in the parent.

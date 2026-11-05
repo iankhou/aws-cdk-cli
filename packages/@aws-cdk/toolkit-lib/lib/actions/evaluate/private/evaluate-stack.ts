@@ -109,6 +109,7 @@ export async function evaluateStackBestEffort(props: EvaluateStackProps): Promis
         .map((r) => [r.LogicalResourceId!, r.PhysicalResourceId!])),
       template: evaluation.template,
       unresolved: evaluation.unresolved,
+      provenance: evaluation.provenance,
       ...(Object.keys(ordered).length > 0 ? { nestedStacks: ordered } : {}),
     };
   }
