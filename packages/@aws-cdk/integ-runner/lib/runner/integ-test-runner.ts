@@ -13,6 +13,8 @@ import { CdkTestApp, DEFAULT_ARGS } from './cdk-test-app';
 import type { IntegTest } from './integration-tests';
 import type { ResolvedSnapshot } from './resolved-snapshot';
 import { resolvedSnapshot, writeResolvedSnapshots } from './resolved-snapshot';
+import type { ResourceCheckReport } from './resource-checks';
+import { formatResourceCheckSummary, runResourceChecks, writeResourceCheckReports } from './resource-checks';
 import type { DestructiveChange, AssertionResults, AssertionResult } from '../workers/common';
 import { DiagnosticReason, formatAssertionResults, formatError } from '../workers/common';
 
@@ -118,6 +120,15 @@ export interface RunOptions extends CommonOptions {
    * @default false
    */
   readonly resolvedSnapshots?: boolean;
+
+  /**
+   * A checkout of the resource checker (cdk-integ-assertions). If given, each deployed test stack's resources are read
+   * back through their service APIs and compared with its resolved template, and the results are written to
+   * `<stackName>.checks.json` in the snapshot. The results are reported, and never fail the test.
+   *
+   * @default - resources are not checked
+   */
+  readonly resourceChecks?: string;
 }
 
 type RunnerOptions = Omit<CdkTestAppOptions, 'outputDirectoryNameTemplate'> & {
@@ -178,6 +189,7 @@ export class IntegTestRunner {
 
     const clean = runOptions.clean ?? true;
     const resolvedSnapshots: ResolvedSnapshot[] = [];
+    const resourceCheckReports: ResourceCheckReport[] = [];
     try {
       for (const [testCaseName, actualTestCase] of Object.entries(actualTestSuite.testSuite)) {
         const updateWorkflowEnabled = (runOptions.updateWorkflow ?? false)
@@ -202,13 +214,30 @@ export class IntegTestRunner {
               allowDeleteFailures,
               runOptions.updateFromTags,
             );
-            if (runOptions.resolvedSnapshots) {
+            if (runOptions.resolvedSnapshots || runOptions.resourceChecks) {
               // while the stacks are still deployed
               const evaluated = await actual.evaluate({
                 stacks: actualTestCase.stacks,
                 context: actualTestCase.cdkCommandOptions?.deploy?.args?.context,
               });
-              resolvedSnapshots.push(...evaluated.map(resolvedSnapshot));
+              if (runOptions.resolvedSnapshots) {
+                resolvedSnapshots.push(...evaluated.map(resolvedSnapshot));
+              }
+              if (runOptions.resourceChecks) {
+                const { reports, errors } = runResourceChecks(evaluated, {
+                  checkerDirectory: runOptions.resourceChecks,
+                  region: this.appOptions.region,
+                  profile: this.appOptions.profile,
+                  env: this.appOptions.env,
+                });
+                for (const report of reports) {
+                  logger.print(`${this.test.testName}/${testCaseName}: resource checks: ${formatResourceCheckSummary(report)}`);
+                }
+                for (const error of errors) {
+                  logger.warning(`${this.test.testName}/${testCaseName}: resource checks could not run for ${error}`);
+                }
+                resourceCheckReports.push(...reports);
+              }
             }
           } finally {
             if (!runOptions.dryRun && clean && (actualTestCase.cdkCommandOptions?.destroy?.enabled ?? true)) {
@@ -229,6 +258,7 @@ export class IntegTestRunner {
         const snapshot = await this.createSnapshot(actualTestSuite.enableLookups);
         // after the snapshot is synthesized, which replaces the snapshot directory
         await writeResolvedSnapshots(snapshot.outputDirectory, resolvedSnapshots);
+        await writeResourceCheckReports(snapshot.outputDirectory, resourceCheckReports);
       }
     } finally {
       actual.cleanup();

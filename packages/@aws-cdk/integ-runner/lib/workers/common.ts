@@ -230,6 +230,14 @@ export interface IntegTestOptions {
   readonly resolvedSnapshots?: boolean;
 
   /**
+   * A checkout of the resource checker (cdk-integ-assertions), to check each deployed test stack's resources
+   * against its resolved template; results are reported, and never fail the test
+   *
+   * @default - resources are not checked
+   */
+  readonly resourceChecks?: string;
+
+  /**
    * In unit test mode, leave the synth output directories, don't clean them.
    *
    * Many of our tests use mocks and don't actually synth output directories, they are

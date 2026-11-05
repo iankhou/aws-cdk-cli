@@ -72,6 +72,7 @@ export async function integTestWorker(request: IntegTestBatchRequest): Promise<I
           roleArn: request.roleArn,
           allowDeleteFailures: request.allowDeleteFailures,
           resolvedSnapshots: request.resolvedSnapshots,
+          resourceChecks: request.resourceChecks,
         });
         if (results && Object.values(results).some(result => result.status === 'fail')) {
           failures.push(testInfo);

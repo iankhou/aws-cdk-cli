@@ -169,6 +169,7 @@ export async function runIntegrationTestsInParallel(
         roleArn: options.roleArn,
         allowDeleteFailures: options.allowDeleteFailures,
         resolvedSnapshots: options.resolvedSnapshots,
+        resourceChecks: options.resourceChecks,
       }], {
         on: (diagnostic: Diagnostic) => {
           printResults(diagnostic);

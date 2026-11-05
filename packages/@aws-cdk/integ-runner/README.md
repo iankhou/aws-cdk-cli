@@ -82,6 +82,12 @@ If not, changes cannot be compared across systems and the [update workflow](#upd
 - `--update-from-tags`
   Deploy snapshots from the given git tags in sequence before deploying the current code.
   Implies `--force`. See [Update From Tags](#update-from-tags) for details.
+- `--resource-checks`
+  Path to a checkout of the resource checker ([cdk-integ-assertions](https://github.com/iankhou/cdk-integ-assertions),
+  with `npm install` run). After deploying, each test stack's resources are read back through their service APIs
+  (read-only calls) and compared with the stack's resolved template. A summary per stack is printed, and the results
+  are written to `<stackName>.checks.json` in the snapshot. The results never fail the test. Implies
+  `--unstable=resolved-snapshots`.
 - `--app`
   The custom CLI command that will be used to run the test files. You can include {filePath} to specify where in the command the test file path should be inserted. Example: --app="python3.8 {filePath}".
 

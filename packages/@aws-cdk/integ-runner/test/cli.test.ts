@@ -351,3 +351,15 @@ describe('--update-from-tags option', () => {
       .toThrow('--update-from-tags and --no-update-workflow cannot be used together');
   });
 });
+
+describe('--resource-checks', () => {
+  test('is resolved to an absolute path', () => {
+    const options = parseCliArgs(['--resource-checks', 'checkouts/cdk-integ-assertions']);
+
+    expect(options.resourceChecks).toEqual(path.resolve('checkouts/cdk-integ-assertions'));
+  });
+
+  test('is not set by default', () => {
+    expect(parseCliArgs([]).resourceChecks).toBeUndefined();
+  });
+});

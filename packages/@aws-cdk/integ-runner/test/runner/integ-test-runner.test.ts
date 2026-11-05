@@ -5,6 +5,7 @@ import { AVAILABILITY_ZONE_FALLBACK_CONTEXT_KEY } from '@aws-cdk/cloud-assembly-
 import { Manifest } from '@aws-cdk/cloud-assembly-schema';
 import fs from 'fs-extra';
 import { IntegTestRunner, IntegTest } from '../../lib/runner';
+import * as resourceChecks from '../../lib/runner/resource-checks';
 import { MockCdkProvider } from '../helpers';
 
 let cdkMock: MockCdkProvider;
@@ -120,6 +121,56 @@ describe('IntegTest runIntegTests', () => {
       }),
       expect.anything(),
     );
+  });
+
+  test('with resource checks, checks the evaluated test stacks before they are destroyed, and writes the reports to the snapshot', async () => {
+    // GIVEN
+    const writeJson = jest.spyOn(fs, 'writeJson').mockImplementation(async () => {
+    });
+    const evaluated = [{
+      stackName: 'test-stack',
+      hierarchicalId: 'test-stack',
+      stackId: 'arn:aws:cloudformation:eu-west-1:123456789012:stack/test-stack/abcd1234-0000-0000-0000-000000000000',
+      physicalResourceIds: { Queue: 'https://sqs.eu-west-1.amazonaws.com/123456789012/test-stack-Queue-1A2B3C4D5E6F' },
+      template: { Resources: { Queue: { Type: 'AWS::SQS::Queue', Properties: { VisibilityTimeout: 30 } } } },
+      unresolved: [],
+    }];
+    cdkMock.mockEvaluate(jest.fn().mockResolvedValue(evaluated));
+    const report = {
+      stackName: 'test-stack',
+      summary: { pass: 1, fail: 1 },
+      results: [
+        { logicalId: 'Queue', type: 'AWS::SQS::Queue', property: '(exists)', status: 'pass' },
+        { logicalId: 'Queue', type: 'AWS::SQS::Queue', property: 'VisibilityTimeout', status: 'fail', expected: 30, actual: '60' },
+      ],
+    };
+    const runChecks = jest.spyOn(resourceChecks, 'runResourceChecks').mockReturnValue({ reports: [report], errors: [] });
+
+    // WHEN
+    const integTest = new IntegTestRunner({
+      cdk: cdkMock.cdk,
+      region: 'eu-west-1',
+      profile: 'test-profile',
+      test: new IntegTest({
+        fileName: 'test/test-data/xxxxx.test-with-snapshot.js',
+        discoveryRoot: 'test/test-data',
+      }),
+      TESTING_usingMocks: true,
+      TESTING_useComparisonOutputDirectory: true,
+    });
+    const results = await integTest.runIntegTestCase({ resourceChecks: '/path/to/cdk-integ-assertions' });
+
+    // THEN: a failed check doesn't fail the test
+    expect(Object.values(results ?? {}).some((r) => r.status === 'fail')).toBe(false);
+    expect(runChecks).toHaveBeenCalledWith(evaluated, expect.objectContaining({
+      checkerDirectory: '/path/to/cdk-integ-assertions',
+      region: 'eu-west-1',
+      profile: 'test-profile',
+    }));
+    expect(runChecks.mock.invocationCallOrder[0]).toBeLessThan(cdkMock.mocks.destroy!.mock.invocationCallOrder[0]);
+    expect(writeJson).toHaveBeenCalledWith('test/test-data/xxxxx.test-with-snapshot.js.snapshot/test-stack.checks.json', report, expect.anything());
+    // resolved snapshots are a separate option
+    expect(writeJson).not.toHaveBeenCalledWith(expect.stringMatching(/\.resolved\.json$/), expect.anything(), expect.anything());
   });
 
   test('without resolved snapshots, does not evaluate the deployed stacks', async () => {
